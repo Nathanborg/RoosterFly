@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+desktop.ini
+Thumbs.db
+
+# model weights and runs (too large for git; see segmentation/realsoil/README.md)
+segmentation/realsoil/*/
+*.pt
+*.pth
+
+# annotations, prediction caches and exports written next to your images
+_annotations/
