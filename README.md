@@ -89,6 +89,7 @@ python roosterfly.py --dir "path/to/image/folder"
 | Ctrl+S | save | Ctrl+Z / Ctrl+Y | undo / redo |
 | Ctrl+Shift+A / D | copy to previous / next image | P | accept the previous date |
 | Shift + stroke | stroke only (no following) | Space | fit view |
+| Wheel | zoom | Wheel pressed / right button + drag | pan |
 
 ## Files written next to your images
 

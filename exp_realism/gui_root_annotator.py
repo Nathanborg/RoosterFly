@@ -1004,8 +1004,9 @@ class SyncInteractiveCanvas(QtWidgets.QWidget):
             Qt.MouseButton.RightButton if hasattr(Qt, "MouseButton") else Qt.RightButton,
             Qt.MouseButton.MiddleButton if hasattr(Qt, "MouseButton") else Qt.MiddleButton,
         ) or self._active_tool == "pan":
-            self._panning = True
+            self._panning = True                             # wheel (middle) or right button held: drag the view
             self._last_mouse_pos = QtCore.QPoint(int(pos.x()), int(pos.y()))
+            self.setCursor(Qt.CursorShape.ClosedHandCursor if hasattr(Qt, "CursorShape") else Qt.ClosedHandCursor)
             return
 
         if btn == (Qt.MouseButton.LeftButton if hasattr(Qt, "MouseButton") else Qt.LeftButton):
@@ -1065,6 +1066,7 @@ class SyncInteractiveCanvas(QtWidgets.QWidget):
     def mouseReleaseEvent(self, event: QtGui.QMouseEvent):
         if self._panning:
             self._panning = False
+            self.unsetCursor()
 
         if self._drawing and self._base_rgb is not None:
             self._drawing = False
@@ -1092,6 +1094,8 @@ class SyncInteractiveCanvas(QtWidgets.QWidget):
         if self._base_rgb is None:
             return
         delta = event.angleDelta().y()
+        if delta == 0 or self._panning:                      # a wheel press / tilt, or dragging: no zoom jump
+            return
         factor = 1.15 if delta > 0 else 0.87
 
         pos = event.position() if hasattr(event, "position") else event.pos()
@@ -1307,6 +1311,7 @@ class RootAnnotatorStudio(QtWidgets.QMainWindow):
         self._transfer_worker: Optional[TransferWorker] = None   # copy to prev/next, accept prev. date
         self._status_hold_until = 0.0
         self._export_worker: Optional[ExportWorker] = None
+        self._edits_gen = 0                              # bumped by Delete all / Discard all: older results are dropped
         self._finder: Optional[RootFinderDialog] = None
 
         self._pred = PredictionService(cache_dir)
@@ -2985,6 +2990,7 @@ class RootAnnotatorStudio(QtWidgets.QMainWindow):
                 _mb("Yes") | _mb("No"), _mb("No"))
             if ans != _mb("Yes"):
                 return
+            self._edits_gen += 1
             for p in dirty:
                 self._states.pop(p, None)
             cur = self._current_path()
@@ -3111,6 +3117,7 @@ class RootAnnotatorStudio(QtWidgets.QMainWindow):
                     moved += 1
                 except OSError as exc:
                     failed.append(f"{os.path.basename(f)}: {exc}")
+            self._edits_gen += 1                         # a carry-over / copy still running must not bring them back
             self._states.clear()
             self._saved_paths.clear()
             if self.current_rgb is not None:                    # the image on screen: the model alone
@@ -3196,7 +3203,8 @@ class RootAnnotatorStudio(QtWidgets.QMainWindow):
             self.status_info_lbl.setText("A transfer is still running - try again in a moment.")
             return
         w = TransferWorker(src_rgb, src_path, src_mask, targets)
-        w.result.connect(self._on_transfer_result)
+        w.result.connect(lambda t, res, err, gen=self._edits_gen:
+                         self._on_transfer_result(t, res, err) if gen == self._edits_gen else None)
         w.finished.connect(lambda w=w: setattr(self, "_transfer_worker", None) if self._transfer_worker is w else None)
         self._transfer_worker = w
         self.status_info_lbl.setText(msg)
@@ -3336,7 +3344,8 @@ class RootAnnotatorStudio(QtWidgets.QMainWindow):
         carry = self.carry_check.isChecked() and not self.state.has_edits()
         worker = CarryOverWorker(path, self.current_rgb, prev, prev_mask, self._ridge_cache,
                                  self._trace_params(True), carry, self._model_mask(), self.current_prob)
-        worker.done.connect(self._on_carry_done)
+        worker.done.connect(lambda path, found, aligned, msg, gen=self._edits_gen:
+                            self._on_carry_done(path, found, aligned, msg) if gen == self._edits_gen else None)
         worker.finished.connect(lambda w=worker: self._carry_workers.remove(w) if w in self._carry_workers else None)
         self._carry_workers.append(worker)
         key = temporal.parse_frame(prev)
