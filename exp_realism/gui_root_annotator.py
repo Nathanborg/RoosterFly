@@ -149,6 +149,32 @@ def _to_u8_rgb(img: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(np.clip(img * 255.0, 0, 255).astype(np.uint8))
 
 
+def _smooth_stroke(pts, radius: int) -> List[Tuple[int, int]]:
+    """Mouse samples resampled every 1.5 px and averaged over ~``radius`` px (5-11 samples, ends kept):
+    the hand's jitter -- and the coarse steps of a zoomed-out view -- no longer show in what is drawn."""
+    p = np.asarray(pts, np.float64).reshape(-1, 2)
+    if len(p) < 3:
+        return [(int(round(x)), int(round(y))) for x, y in p]
+    keep = np.r_[True, np.any(np.abs(np.diff(p, axis=0)) > 1e-9, axis=1)]
+    p = p[keep]
+    seg = np.hypot(*np.diff(p, axis=0).T)
+    cum = np.r_[0.0, np.cumsum(seg)]
+    if len(p) < 3 or cum[-1] < 3.0:
+        return [(int(round(x)), int(round(y))) for x, y in p]
+    t = np.linspace(0.0, cum[-1], max(2, int(cum[-1] / 1.5) + 1))
+    q = np.c_[np.interp(t, cum, p[:, 0]), np.interp(t, cum, p[:, 1])]
+    k = int(np.clip(round(radius / 1.5), 5, 11)) | 1
+    k = min(k, len(q) if len(q) % 2 else len(q) - 1)
+    if k >= 3:
+        pad = np.pad(q, ((k // 2, k // 2), (0, 0)), mode="edge")
+        ker = np.ones(k) / k
+        sm = np.stack([np.convolve(pad[:, j], ker, mode="valid") for j in range(2)], 1)
+        sm[0], sm[-1] = q[0], q[-1]
+        q = sm
+    out = [(int(round(x)), int(round(y))) for x, y in q]
+    return [pt for i, pt in enumerate(out) if i == 0 or pt != out[i - 1]]
+
+
 def _shift_held() -> bool:
     mod = Qt.KeyboardModifier.ShiftModifier if hasattr(Qt, "KeyboardModifier") else Qt.ShiftModifier
     return bool(QtWidgets.QApplication.keyboardModifiers() & mod)
@@ -952,7 +978,7 @@ class SyncInteractiveCanvas(QtWidgets.QWidget):
         else:
             x, y, w, h = cv2.boundingRect(np.ascontiguousarray(mask, dtype=np.uint8))
             rgba = np.zeros((h, w, 4), np.uint8)
-            rgba[mask[y:y + h, x:x + w] > 0] = (255, 215, 0, 170)
+            rgba[mask[y:y + h, x:x + w] > 0] = (255, 215, 0, 115)          # see-through: the root stays visible
             fmt = (QtGui.QImage.Format.Format_RGBA8888 if hasattr(QtGui.QImage, "Format")
                    else QtGui.QImage.Format_RGBA8888)
             self._preview_img = QtGui.QImage(rgba.data, w, h, 4 * w, fmt).copy()
@@ -961,7 +987,11 @@ class SyncInteractiveCanvas(QtWidgets.QWidget):
 
     def _emit_progress(self):
         if self._drawing and self._current_stroke_pts:
-            self.sig_stroke_progress.emit(list(self._current_stroke_pts), self._active_tool)
+            self.sig_stroke_progress.emit(self._stroke_points(), self._active_tool)
+
+    def _stroke_points(self) -> List[Tuple[int, int]]:
+        """The stroke so far with hand / pixel jitter averaged out (what is drawn, painted and traced)."""
+        return _smooth_stroke(self._current_stroke_pts, self._brush_radius)
 
     def set_tool(self, tool_name: str):
         self._active_tool = tool_name
@@ -1073,7 +1103,7 @@ class SyncInteractiveCanvas(QtWidgets.QWidget):
             H, W = self._base_rgb.shape[:2]
             stroke_mask = np.zeros((H, W), dtype=np.uint8)
             thick = max(1, self._brush_radius * 2)
-            pts = self._current_stroke_pts
+            pts = self._stroke_points()
             if len(pts) == 1:
                 cv2.circle(stroke_mask, pts[0], self._brush_radius, 1, -1)
             else:
@@ -1150,54 +1180,32 @@ class SyncInteractiveCanvas(QtWidgets.QWidget):
             qimg_base = _rgb_to_qimage(self._base_rgb)
             painter.drawImage(dest_rect, qimg_base)
 
-        # 2. In-progress drawing stroke (immediate visual feedback while dragging)
+        # 2. In-progress stroke: a translucent band exactly the brush's width (the image stays visible) and the
+        #    stabilised path as a thin line; fainter still once the snapped smart-brush trace shows
         if self._drawing and len(self._current_stroke_pts) > 0:
             snapped = self._preview_img is not None
-            pen_color = (
-                QtGui.QColor(255, 30, 30, 70 if snapped else 230)  # faint brush once the snapped trace shows
-                if self._active_tool in ("brush", "pen")
-                else QtGui.QColor(60, 180, 255, 230)
-            )
-            pen_w = max(2.0, self._brush_radius * 2 * self._zoom)
-            painter.setPen(
-                QtGui.QPen(
-                    pen_color,
-                    pen_w,
-                    Qt.PenStyle.SolidLine
-                    if hasattr(Qt, "PenStyle")
-                    else Qt.SolidLine,
-                    Qt.PenCapStyle.RoundCap
-                    if hasattr(Qt, "PenCapStyle")
-                    else Qt.RoundCap,
-                    Qt.PenJoinStyle.RoundJoin
-                    if hasattr(Qt, "PenJoinStyle")
-                    else Qt.RoundJoin,
-                )
-            )
-            painter.setBrush(QtGui.QBrush(pen_color))
-
-            pts_scr = [
-                QtCore.QPointF(
-                    pt[0] * self._zoom + self._offset_x,
-                    pt[1] * self._zoom + self._offset_y,
-                )
-                for pt in self._current_stroke_pts
-            ]
+            rgb = (60, 180, 255) if self._active_tool == "eraser" else (255, 60, 60)
+            band = QtGui.QColor(*rgb, 35 if snapped else 70)
+            r = self._brush_radius * self._zoom
+            pts_scr = [QtCore.QPointF(x * self._zoom + self._offset_x, y * self._zoom + self._offset_y)
+                       for x, y in self._stroke_points()]
+            no_pen = Qt.PenStyle.NoPen if hasattr(Qt, "PenStyle") else Qt.NoPen
+            no_brush = Qt.BrushStyle.NoBrush if hasattr(Qt, "BrushStyle") else Qt.NoBrush
             if len(pts_scr) == 1:
-                painter.drawEllipse(
-                    pts_scr[0],
-                    self._brush_radius * self._zoom,
-                    self._brush_radius * self._zoom,
-                )
+                painter.setPen(no_pen)
+                painter.setBrush(QtGui.QBrush(band))
+                painter.drawEllipse(pts_scr[0], r, r)
             else:
-                for i in range(len(pts_scr) - 1):
-                    painter.drawLine(pts_scr[i], pts_scr[i + 1])
-                for pt in pts_scr:
-                    painter.drawEllipse(
-                        pt,
-                        self._brush_radius * self._zoom,
-                        self._brush_radius * self._zoom,
-                    )
+                cap = Qt.PenCapStyle.RoundCap if hasattr(Qt, "PenCapStyle") else Qt.RoundCap
+                join = Qt.PenJoinStyle.RoundJoin if hasattr(Qt, "PenJoinStyle") else Qt.RoundJoin
+                solid = Qt.PenStyle.SolidLine if hasattr(Qt, "PenStyle") else Qt.SolidLine
+                poly = QtGui.QPolygonF(pts_scr)
+                painter.setBrush(no_brush)
+                painter.setPen(QtGui.QPen(band, max(2.0, 2.0 * r), solid, cap, join))   # one path: no alpha build-up
+                painter.drawPolyline(poly)
+                painter.setPen(QtGui.QPen(QtGui.QColor(*rgb, 210), 1.3, solid, cap, join))
+                painter.drawPolyline(poly)
+            painter.setBrush(no_brush)
 
         if self._drawing and self._preview_img is not None:
             px, py = self._preview_off
@@ -2748,8 +2756,9 @@ class RootAnnotatorStudio(QtWidgets.QMainWindow):
         if show_user and self.state is not None:
             for tm, col in ((self.state.trace_mask("carried", box), (255, 150, 0)),
                             (self.state.pen[y0:y1, x0:x1] | self.state.trace_mask("user", box), (255, 30, 30))):
-                if tm.any():                                     # tint the edited pixels only
-                    tint(left, tm, col, 0.35)
+                if tm.any():                                     # a light tint and an outline: the root stays visible
+                    tint(left, tm, col, 0.6)
+                    outline(left, tm, col)
         if self.prev_overlay is not None and self.show_prev_check.isChecked():
             outline(left, self.prev_overlay[y0:y1, x0:x1], (0, 230, 255))
         if show_contours and has:

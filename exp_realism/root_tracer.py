@@ -72,6 +72,14 @@ _COLOUR_STEP = 0.3            # following: step score x (1 - this + this x P(roo
 _COLOUR_CREST = 2.0           # a stroke's own root samples: within this of its snapped crest (px)
 _COLOUR_WIDTH = 0.5           # width profiles: colour adds up to +-0.5 x this x the channel's span
 _COLOUR_HALF_PX = 300_000      # colour posterior at half resolution above this box size (it is blurred anyway)
+# Outline smoothness, tuned on simulated strokes over PRMI simulated frames (exact masks) and 80 annotated
+# Panama frames: wiggle of the centre line -35 %, lumps along the sides -48 %, F1 -0.006
+_PATH_SMOOTH = 7              # centreline: moving average over this many 1-px samples ...
+_PATH_SMOOTH_W = 2.0          # ... or over this x the root's width when longer (0 = off)
+_WIDTH_SIGMA = 3.0            # root edges: Gaussian smoothing of the widths along the root (samples; 0 = off)
+_MASK_SIGMA = 0.0             # outline: Gaussian blur of the drawn mask, re-thresholded at 0.5 (0 = off)
+_ROUTE_DEV = 1.0              # centre line under a stroke: cost of straying from the drawn line, x (dist / brush)^2
+                              # (sloppy strokes, +-4 px: F1 Panama 0.536 -> 0.546, PRMI 0.564 -> 0.567)
 
 
 @dataclass
@@ -98,6 +106,7 @@ class TraceResult:
     score: float = 0.0            # ridge under the stroke / soil texture (x contrast)
     contrast: float = 0.0         # crest brightness above soil, fraction of the ROI's dynamic range
     note: str = ""
+    widths: Optional[np.ndarray] = None   # diameter along ``centerline`` (px)
 
 
 # ------------------------------------------------------------------------------
@@ -389,6 +398,15 @@ def _colour_gain(cp: np.ndarray) -> np.ndarray:
     return np.interp(cp, xp, fp).astype(np.float32)
 
 
+def _smooth1d(v: np.ndarray, sigma: float) -> np.ndarray:
+    """Gaussian smoothing of a profile along the root (edge-padded)."""
+    r = int(np.ceil(3 * sigma))
+    x = np.arange(-r, r + 1)
+    k = np.exp(-x ** 2 / (2.0 * sigma ** 2))
+    k /= k.sum()
+    return np.convolve(np.pad(np.asarray(v, np.float64), r, mode="edge"), k, mode="valid").astype(np.float32)
+
+
 def _smooth_ratio(new: np.ndarray, old: np.ndarray, k: int = 31) -> np.ndarray:
     """``new / old`` per sample as a running median over ``k`` samples (one median on short paths), 0.8-1.3x."""
     r = (new / np.maximum(old, _EPS)).astype(np.float32)
@@ -603,11 +621,11 @@ def _follow(
 # Width: root edges found on intensity profiles across the centreline
 # ------------------------------------------------------------------------------
 
-def _smooth_path(cl: np.ndarray, spacing: float = 1.0) -> np.ndarray:
-    """Centreline without the 8-connected pixel jitter, resampled; ends kept."""
+def _smooth_path(cl: np.ndarray, spacing: float = 1.0, k: Optional[int] = None) -> np.ndarray:
+    """Centreline without the 8-connected pixel jitter (moving average over ``k`` samples), resampled; ends kept."""
     cl = np.asarray(cl, np.float64).reshape(-1, 2)
     if len(cl) >= 5:
-        k = min(7, (len(cl) // 2) * 2 - 1)
+        k = min(int(k or _PATH_SMOOTH) | 1, (len(cl) // 2) * 2 - 1)
         pad = np.pad(cl, ((k // 2, k // 2), (0, 0)), mode="edge")
         ker = np.ones(k) / k
         sm = np.stack([np.convolve(pad[:, j], ker, mode="valid") for j in range(2)], 1)
@@ -916,7 +934,10 @@ def trace_root(
     if is_click:                                              # a click is usually placed on the root itself
         near = np.exp(-(d_line ** 2) / (2.0 * max(2.0, 0.5 * r) ** 2)).astype(np.float32)
     pull = np.where(corridor, E0 * (0.5 + 0.5 * near), -1.0)       # crest, preferably near the stroke
-    cost = np.where(corridor, 1.0 / (0.05 + E0 * (0.5 + 0.5 * near)), 1e4).astype(np.float64)
+    # where texture is busy and no crest stands out, the drawn (stabilised) line is the best guide: straying
+    # from it costs on its own, so the centre line does not snake from bump to bump inside the brush
+    dev = 0.0 if is_click else _ROUTE_DEV * (d_line / float(r)) ** 2
+    cost = np.where(corridor, 1.0 / (0.05 + E0 * (0.5 + 0.5 * near)) + dev, 1e4).astype(np.float64)
     a = _snap(pull, sp[0], r)
     if is_click:
         cl = a[None, :]
@@ -1032,20 +1053,41 @@ def trace_root(
         path[:, 1] = np.clip(path[:, 1], 0, h - 1)
     nrm = _normals(path, theta0)
     fw, span_w = _width_channel(fs, span, ch_name, tone, chans, width_channels, (y0, y1, x0, x1), path, k_bg)
-    min_width = None
-    if prior is not None and widen:
-        pe = _mask_extents(prior[y0:y1, x0:x1], path, nrm, search_r).sum(1)
-        if (pe > 0).mean() >= 0.5:
-            min_width = 0.9 * float(np.median(pe[pe > 0]))
-    a, b = _profile_extents(fw, path, nrm, search_r, edge_frac, 0.03 * span_w, span_w, min_width=min_width)
-    if cp is not None:
-        # the edges where root and soil also differ in colour; applied as a ratio smoothed along the
-        # root, so colour noise in busy soil changes the width gently instead of adding lumps
-        ac, bc = _profile_extents(fw + (_COLOUR_WIDTH * span_w) * (cp - 0.5), path, nrm, search_r, edge_frac,
-                                  0.03 * span_w, span_w, min_width=min_width)
-        a = np.clip(a * _smooth_ratio(ac, a), 0.75, search_r)
-        b = np.clip(b * _smooth_ratio(bc, b), 0.75, search_r)
+
+    def measure(path, nrm):
+        """Root edges on both sides of ``path`` (and the prediction's width as a floor when widening)."""
+        min_width = None
+        if prior is not None and widen:
+            pe = _mask_extents(prior[y0:y1, x0:x1], path, nrm, search_r).sum(1)
+            if (pe > 0).mean() >= 0.5:
+                min_width = 0.9 * float(np.median(pe[pe > 0]))
+        a, b = _profile_extents(fw, path, nrm, search_r, edge_frac, 0.03 * span_w, span_w, min_width=min_width)
+        if cp is not None:
+            # the edges where root and soil also differ in colour; applied as a ratio smoothed along the
+            # root, so colour noise in busy soil changes the width gently instead of adding lumps
+            ac, bc = _profile_extents(fw + (_COLOUR_WIDTH * span_w) * (cp - 0.5), path, nrm, search_r, edge_frac,
+                                      0.03 * span_w, span_w, min_width=min_width)
+            a = np.clip(a * _smooth_ratio(ac, a), 0.75, search_r)
+            b = np.clip(b * _smooth_ratio(bc, b), 0.75, search_r)
+        return a, b
+
+    a, b = measure(path, nrm)
+    if _PATH_SMOOTH_W > 0 and len(path) > 15:
+        # a wide root's crest wanders inside it (texture ridges): smooth its centre line over a stretch
+        # proportional to its width, then measure again -- no hooks, loops or wobbly sides
+        k = int(np.clip(round(_PATH_SMOOTH_W * float(np.median(a + b))), 7, 41)) | 1
+        if k > int(_PATH_SMOOTH):
+            path = _smooth_path(cl, 1.0, k)
+            nrm = _normals(path, theta0)
+            a, b = measure(path, nrm)
+    if _WIDTH_SIGMA > 0 and len(a) >= 5:                     # edges that run smoothly along the root
+        a, b = _smooth1d(a, _WIDTH_SIGMA), _smooth1d(b, _WIDTH_SIGMA)
     sub = _strip_mask((h, w), path, nrm, a, b)
+    if _MASK_SIGMA > 0:                                      # no pixel stair-steps on the outline
+        sm = cv2.GaussianBlur(sub.astype(np.float32), (0, 0), _MASK_SIGMA) > 0.5
+        line = np.zeros_like(sub)
+        cv2.polylines(line, [np.round(path * 16).astype(np.int32).reshape(-1, 1, 2)], False, 1, 1, shift=4)
+        sub = (sm | (line > 0)).astype(np.uint8)              # a hair-thin root keeps its centre line
     if widen and footprint is not None:                      # re-measuring a segment stays inside the brush
         fp = cv2.dilate((footprint[y0:y1, x0:x1] > 0).astype(np.uint8), _disk(2))
         sub = (sub.astype(bool) & (fp > 0)).astype(np.uint8)
@@ -1056,7 +1098,7 @@ def trace_root(
             + (f", followed +{followed:.0f} px (ends: {' / '.join(reasons)})" if follow else "")
             + (", re-measured over the existing segment" if widen else "")
             + (", colour cue" if cp is not None else ""))
-    return TraceResult(out, path + off, tone, ch_name, followed, width, score, ref_con / span, note)
+    return TraceResult(out, path + off, tone, ch_name, followed, width, score, ref_con / span, note, a + b)
 
 
 __all__ = ["SIGMAS", "TraceParams", "TraceResult", "RidgeCache", "ColourCue", "colour_features", "image_channels",
