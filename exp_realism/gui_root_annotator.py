@@ -88,6 +88,8 @@ from exp_realism.annotator_backend import (  # noqa: E402
     load_cached_prob,
     load_model_bundle,
     mask_border,
+    predict_maps,
+    centre_cache_path,
     predict_prob,
     prob_cache_path,
     read_rgb,
@@ -203,6 +205,8 @@ def _rgb_to_qimage(rgb: np.ndarray) -> QtGui.QImage:
 # ==============================================================================
 
 PRIO_CURRENT, PRIO_LOOKAHEAD, PRIO_BATCH = 0, 1, 2
+SEP_VIEW = "Separate roots (model centre lines)"
+CENTRE_TASK = "|centre"   # queue key suffix: the centre-line map of an image whose prediction is cached
 
 
 class PredictionService(QThread):
@@ -215,6 +219,7 @@ class PredictionService(QThread):
     """
 
     result_ready = Signal(str, str, object, float, bool)   # tag, path, prob, seconds, from_disk
+    centre_ready = Signal(str, str, object)                 # tag, path, centre-line map (model's 2nd head)
     failed = Signal(str, str)                               # path, message
     batch_progress = Signal(int, int, float)                # done, total, seconds per predicted image
 
@@ -250,7 +255,7 @@ class PredictionService(QThread):
     def focus(self, current: Optional[str], lookahead: List[str]):
         """Serve ``current`` next and keep ``lookahead`` queued; older focus requests are demoted."""
         with self._cv:
-            keep = set(lookahead) | ({current} if current else set())
+            keep = set(lookahead) | ({current, current + CENTRE_TASK} if current else set())
             for p, (prio, _) in list(self._tasks.items()):
                 if prio < PRIO_BATCH and p not in keep:
                     if p in self._batch:
@@ -312,28 +317,56 @@ class PredictionService(QThread):
                 self.failed.emit(path, f"{type(exc).__name__}: {exc}")
 
     def _serve(self, path: str, prio: int, bundle: Dict[str, Any], tta: bool, tag: str):
+        if path.endswith(CENTRE_TASK):                      # centre lines of an image cached before they were kept
+            self._serve_centre(path[: -len(CENTRE_TASK)], bundle, tta, tag)
+            return
         cpath = prob_cache_path(path, tag, self.cache_dir)
         t0 = time.time()
-        if prio == PRIO_BATCH and os.path.exists(cpath):
-            self._count_batch(path, None)                   # already cached: nothing to load
+        two_heads = bundle.get("n_out", 1) > 1
+        if prio == PRIO_BATCH and os.path.exists(cpath) and (
+                not two_heads or os.path.exists(centre_cache_path(path, tag, self.cache_dir))):
+            self._count_batch(path, None)                   # already cached (with its centre lines): nothing to do
             return
         prob = load_cached_prob(cpath)
+        centre = load_cached_prob(centre_cache_path(path, tag, self.cache_dir)) if (two_heads and prob is not None) else None
         from_disk = prob is not None
         rgb = None
         if prob is None:
             rgb = read_rgb(path)
             if rgb is None:
                 raise IOError(f"cannot read {path}")
-            prob = predict_prob(bundle, rgb, tta)
-            save_cached_prob(cpath, prob)                   # the cache keeps the raw map
+            prob, centre = predict_maps(bundle, rgb, tta)
+            save_cached_prob(cpath, prob)                   # the cache keeps the raw maps
+            if centre is not None:
+                save_cached_prob(centre_cache_path(path, tag, self.cache_dir), centre)
         if bundle.get("border_mask"):
             rgb = rgb if rgb is not None else read_rgb(path)
             if rgb is not None and rgb.shape[:2] == prob.shape:
                 prob = mask_border(prob, rgb)
+                if centre is not None:
+                    centre = mask_border(centre, rgb)
         secs = time.time() - t0
         self._count_batch(path, None if from_disk else secs)
         if prio < PRIO_BATCH:
             self.result_ready.emit(tag, path, prob, secs, from_disk)
+            if centre is not None:
+                self.centre_ready.emit(tag, path, centre)
+            elif two_heads and prio == PRIO_CURRENT:        # predicted before the centre lines were cached
+                with self._cv:
+                    self._put(path + CENTRE_TASK, PRIO_LOOKAHEAD)
+                    self._cv.notify_all()
+
+    def _serve_centre(self, path: str, bundle: Dict[str, Any], tta: bool, tag: str):
+        rgb = read_rgb(path)
+        if rgb is None:
+            raise IOError(f"cannot read {path}")
+        prob, centre = predict_maps(bundle, rgb, tta)
+        if centre is None:
+            return
+        save_cached_prob(centre_cache_path(path, tag, self.cache_dir), centre)
+        if bundle.get("border_mask") and rgb.shape[:2] == centre.shape:
+            centre = mask_border(centre, rgb)
+        self.centre_ready.emit(tag, path, centre)
 
     def _count_batch(self, path: str, secs: Optional[float]):
         with self._cv:
@@ -389,14 +422,16 @@ class CarryOverWorker(QThread):
 
 
 class ExportWorker(QThread):
-    """Writes the root-traits CSV (``root_export``), one row per image, off the GUI thread."""
+    """Writes the root-traits CSV (``root_export``): one row per image or per separated root, off the GUI thread."""
 
     progress = Signal(int, int)
     done = Signal(str, int, str)                            # csv path, rows written, error
 
-    def __init__(self, out_path: str, jobs: List[dict], px_per_mm: float):
+    def __init__(self, out_path: str, jobs: List[dict], px_per_mm: float, per_root: bool = False,
+                 centre_lines: bool = True):
         super().__init__()
         self.out_path, self.jobs, self.px_per_mm = out_path, jobs, px_per_mm
+        self.per_root, self.centre_lines = per_root, centre_lines
         self._stop = False
 
     def stop(self):
@@ -404,12 +439,13 @@ class ExportWorker(QThread):
 
     def run(self):
         import csv
-        from exp_realism import root_export
+        from exp_realism import root_export, root_separation
         n = 0
         try:
             os.makedirs(os.path.dirname(self.out_path) or ".", exist_ok=True)
             with open(self.out_path, "w", newline="", encoding="utf-8") as fh:
-                wr = csv.DictWriter(fh, fieldnames=root_export.COLUMNS)
+                cols = root_export.ROOT_COLUMNS if self.per_root else root_export.COLUMNS
+                wr = csv.DictWriter(fh, fieldnames=cols)
                 wr.writeheader()
                 for i, j in enumerate(self.jobs):
                     if self._stop:
@@ -429,13 +465,96 @@ class ExportWorker(QThread):
                                 mask[:e] = mask[-e:] = False
                                 mask[:, :e] = mask[:, -e:] = False
                     source = j["source"] if mask is not None else "not predicted yet"
-                    wr.writerow(root_export.image_row(j["path"], j["index"], mask, source, self.px_per_mm,
-                                                      thr if j["source"] == "model prediction" else None))
-                    n += 1
+                    sep, centre_src = None, ""
+                    if mask is not None and (self.per_root or self.centre_lines):
+                        model_c = j.get("centre")
+                        if model_c is None and j.get("centre_path"):
+                            model_c = load_cached_prob(j["centre_path"])
+                        if model_c is not None and model_c.shape != mask.shape:
+                            model_c = None
+                        centre_src = "model centre lines" if model_c is not None else "mask shape"
+                        sep = root_separation.separate_roots(mask, root_separation.centre_map(mask, model_c))
+                    thr_out = thr if j["source"] == "model prediction" else None
+                    if self.per_root:
+                        if mask is not None:
+                            for row in root_export.root_table(j["path"], j["index"], sep, source, self.px_per_mm,
+                                                              centre_src):
+                                wr.writerow(row)
+                                n += 1
+                    else:
+                        wr.writerow(root_export.image_row(j["path"], j["index"], mask, source, self.px_per_mm, thr_out,
+                                                          sep, f"centre lines ({centre_src})"))
+                        n += 1
             self.progress.emit(len(self.jobs), len(self.jobs))
             self.done.emit(self.out_path, n, "stopped" if self._stop else "")
         except Exception as exc:
             self.done.emit(self.out_path, n, f"{type(exc).__name__}: {exc}")
+
+
+class ExportDialog(QtWidgets.QDialog):
+    """Rows (per image / per root), which images, and where the length comes from."""
+
+    def __init__(self, parent, default_path: str):
+        super().__init__(parent)
+        self.setWindowTitle("Export root traits (CSV)")
+        form = QtWidgets.QFormLayout(self)
+        self.rows = QtWidgets.QComboBox()
+        self.rows.addItems(["One row per image", "One row per root (separated along the model's centre lines)"])
+        self.scope = QtWidgets.QComboBox()
+        self.scope.addItems(["Annotated images only (saved or edited)",
+                             "All images (the model's prediction where not annotated)"])
+        self.length = QtWidgets.QComboBox()
+        self.length.addItems(["Model centre lines (touching roots separated)", "Mask skeleton"])
+        self.length.setToolTip("Centre lines: the roots are separated along the model's centre-line map, so a clump\n"
+                               "of touching roots is measured root by root (no spurious skeleton spokes). Images\n"
+                               "predicted before the map was kept use the mask's own shape instead.")
+        self.rows.currentIndexChanged.connect(lambda i: self.length.setEnabled(i == 0))
+        form.addRow("Rows:", self.rows)
+        form.addRow("Images:", self.scope)
+        form.addRow("Length from:", self.length)
+        path_row = QtWidgets.QHBoxLayout()
+        self.path = QtWidgets.QLineEdit(default_path)
+        self.path.setMinimumWidth(420)
+        browse = QtWidgets.QPushButton("…")
+        browse.setFixedWidth(30)
+        browse.clicked.connect(self._browse)
+        path_row.addWidget(self.path)
+        path_row.addWidget(browse)
+        form.addRow("Save to:", path_row)
+        bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.button(QtWidgets.QDialogButtonBox.Ok).setText("Export")
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        form.addRow(bb)
+
+    def _browse(self):
+        out, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save root traits", self.path.text(), "CSV (*.csv)")
+        if out:
+            self.path.setText(out)
+
+    def choices(self) -> Dict[str, Any]:
+        return {"per_root": self.rows.currentIndex() == 1, "all_images": self.scope.currentIndex() == 1,
+                "centre_lines": self.rows.currentIndex() == 1 or self.length.currentIndex() == 0,
+                "path": self.path.text().strip()}
+
+
+class SeparationWorker(QThread):
+    """Separates the roots on screen (``root_separation``) off the GUI thread."""
+
+    done = Signal(object, object, str)                      # key, (Separation, length px, model map used), error
+
+    def __init__(self, key: tuple, mask: np.ndarray, model_centre: Optional[np.ndarray]):
+        super().__init__()
+        self.key, self.mask, self.model_centre = key, mask, model_centre
+
+    def run(self):
+        from exp_realism import root_separation as RS
+        try:
+            mc = self.model_centre if (self.model_centre is not None and self.model_centre.shape == self.mask.shape) else None
+            sep = RS.separate_roots(self.mask, RS.centre_map(self.mask, mc))
+            self.done.emit(self.key, (sep, RS.centre_length_px(sep), mc is not None), "")
+        except Exception as exc:
+            self.done.emit(self.key, None, f"{type(exc).__name__}: {exc}")
 
 
 class _ElidedLabel(QtWidgets.QLabel):
@@ -1319,11 +1438,18 @@ class RootAnnotatorStudio(QtWidgets.QMainWindow):
         self._transfer_worker: Optional[TransferWorker] = None   # copy to prev/next, accept prev. date
         self._status_hold_until = 0.0
         self._export_worker: Optional[ExportWorker] = None
+        self.current_centre: Optional[np.ndarray] = None   # the model's centre-line map of the image on screen
+        self._centre_mem: "OrderedDict[Tuple[str, str], np.ndarray]" = OrderedDict()
+        self._sep_result: Optional[tuple] = None           # (key, (Separation, length px, model map used))
+        self._sep_worker: Optional[SeparationWorker] = None
+        self._sep_wanted = False
+        self._sep_view: Tuple[Any, Optional[np.ndarray]] = (None, None)
         self._edits_gen = 0                              # bumped by Delete all / Discard all: older results are dropped
         self._finder: Optional[RootFinderDialog] = None
 
         self._pred = PredictionService(cache_dir)
         self._pred.result_ready.connect(self._on_prediction_ready)
+        self._pred.centre_ready.connect(self._on_centre_ready)
         self._pred.failed.connect(self._on_prediction_failed)
         self._pred.batch_progress.connect(self._on_batch_progress)
         self._pred.start()
@@ -1794,7 +1920,9 @@ class RootAnnotatorStudio(QtWidgets.QMainWindow):
         self.btn_prepredict.setCheckable(True)
         self.btn_prepredict.setToolTip(
             "Predict every image of the folder in the background (starting from the current one)\n"
-            "and cache the maps on disk. Images you open are always served first. Click again to stop."
+            "and cache the maps on disk - with the model's centre-line maps, also for images predicted before\n"
+            "they were kept (for 'Separate roots' and centre-line lengths in the export). Images you open are\n"
+            "always served first. Click again to stop."
         )
         self.btn_prepredict.toggled.connect(self._on_prepredict_toggled)
         tracer_ribbon.addWidget(self.btn_prepredict)
@@ -1855,7 +1983,11 @@ class RootAnnotatorStudio(QtWidgets.QMainWindow):
             "Probability Heatmap (Jet)",
             "Blended RGB Overlay",
             "Binary Mask (B&W)",
+            SEP_VIEW,
         ])
+        self.view_mode_combo.setToolTip(
+            f"{SEP_VIEW}: every root in its own colour with its centre line (white), separated where roots touch\n"
+            "or cross along the model's centre-line map (its second output), recomputed after each edit.")
         self.view_mode_combo.currentIndexChanged.connect(self._update_overlays)
         right_title_bar.addWidget(self.view_mode_combo)
 
@@ -1951,6 +2083,17 @@ class RootAnnotatorStudio(QtWidgets.QMainWindow):
         traits_layout.addWidget(self.trait_count_lbl)
 
         traits_layout.addStretch(1)
+
+        traits_layout.addWidget(QtWidgets.QLabel("Length from:"))
+        self.length_src_combo = QtWidgets.QComboBox()
+        self.length_src_combo.addItems(["Centre lines", "Mask skeleton"])
+        self.length_src_combo.setToolTip(
+            "Centre lines: roots separated along the model's centre-line map and measured one by one - a clump of\n"
+            "touching roots is not one blob whose skeleton grows spurious spokes (shapes drawn by hand use their\n"
+            "own shape). Mask skeleton: the skeleton of the mask as it is.")
+        self.length_src_combo.currentIndexChanged.connect(lambda _i: self._traits_timer.start())
+        traits_layout.addWidget(self.length_src_combo)
+        traits_layout.addSpacing(12)
 
         traits_layout.addWidget(QtWidgets.QLabel("Resolution:"))
         self.px_per_mm_spin = QtWidgets.QDoubleSpinBox()
@@ -2450,6 +2593,7 @@ class RootAnnotatorStudio(QtWidgets.QMainWindow):
         self.state, self._state_path = st, fpath
         self.prev_overlay, self._carry_msg = None, ""
         self.current_prob = None
+        self.current_centre = None
         self.canvas_left.set_prob_map(None)
         self.canvas_right.set_prob_map(None)
 
@@ -2572,7 +2716,10 @@ class RootAnnotatorStudio(QtWidgets.QMainWindow):
         prob = self._prob_mem.get((tag, path))
         if prob is not None:
             self._prob_mem.move_to_end((tag, path))
-            self._pred.focus(None, ahead)
+            centre = self._centre_mem.get((tag, path))
+            if centre is not None:
+                self.current_centre = centre
+            self._pred.focus(None if centre is not None else path, ahead)   # the service brings the centre lines
             if self.current_prob is not prob:
                 self._apply_prediction(prob, "ready (predicted ahead)")
         else:
@@ -2616,6 +2763,7 @@ class RootAnnotatorStudio(QtWidgets.QMainWindow):
             self._pred.configure(self.bundle, self.tta_check.isChecked())
         if self.current_rgb is not None:
             self.current_prob = None
+            self.current_centre = None
             self.canvas_left.set_prob_map(None)
             self.canvas_right.set_prob_map(None)
             self._update_overlays()
@@ -2735,7 +2883,15 @@ class RootAnnotatorStudio(QtWidgets.QMainWindow):
             img[mm] = np.clip(img[mm] * keep + np.array(col, dtype=np.float32) * (1.0 - keep), 0, 255).astype(np.uint8)
 
         # 1. RIGHT CANVAS: Model Probability Map & Segmentation
-        if self.current_prob is None:
+        if view_mode == SEP_VIEW:
+            img = self._separation_image()
+            if img is not None and img.shape[:2] == self.current_rgb.shape[:2]:
+                right = img[y0:y1, x0:x1].copy()
+            else:                                                # still separating: the roots in grey meanwhile
+                right = rgb.copy()
+                if has:
+                    tint(right, m, (210, 210, 210), 0.5)
+        elif self.current_prob is None:
             right = rgb.copy()
         elif view_mode == "Binary Mask (B&W)":
             right = cv2.cvtColor(m.astype(np.uint8) * 255 if m is not None else np.zeros(rgb.shape[:2], np.uint8),
@@ -2773,6 +2929,9 @@ class RootAnnotatorStudio(QtWidgets.QMainWindow):
             return
         if not (isinstance(region, tuple) and len(region) == 4):
             region = None
+        if self.view_mode_combo.currentText() == SEP_VIEW:      # separation is global: redraw it whole
+            region = None
+            self._request_separation()
 
         H, W = self.current_rgb.shape[:2]
         mask = self._get_active_binary_mask()
@@ -3022,30 +3181,33 @@ class RootAnnotatorStudio(QtWidgets.QMainWindow):
                 return
             if not self.image_files:
                 return
-            all_opt = "All images (the model's prediction where not annotated)"
-            ann_opt = "Annotated images only (saved or edited)"
-            choice, ok = QtWidgets.QInputDialog.getItem(self, "Export root traits (CSV)", "Which images?",
-                                                        [ann_opt, all_opt], 0, False)
-            if not ok:
-                return
             folder = os.path.dirname(self.image_files[0])
             default = os.path.join(folder, "_annotations", f"roots_export_{time.strftime('%Y%m%d-%H%M')}.csv")
-            out, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save root traits", default, "CSV (*.csv)")
+            dlg = ExportDialog(self, default)
+            if not (dlg.exec_() if hasattr(dlg, "exec_") else dlg.exec()):
+                return
+            opt = dlg.choices()
+            out = opt["path"]
             if not out:
                 return
+            if opt["per_root"] and not out.lower().endswith("_roots.csv"):
+                out = out[:-4] + "_roots.csv" if out.lower().endswith(".csv") else out + "_roots.csv"
             self._stash_state()
             thr, edge, tag = self.thresh_spin.value(), self.edge_margin_spin.value(), self._current_tag()
             jobs = []
             for i, p in enumerate(self.image_files):
                 st = self.state if p == self._state_path else self._states.get(p)
                 saved = self._annotation_files(p)[2]
-                base = {"path": p, "index": i + 1}
+                base = {"path": p, "index": i + 1, "centre": self._centre_mem.get((tag, p)),
+                        "centre_path": centre_cache_path(p, tag, self.cache_dir)}
+                if p == self._current_path() and self.current_centre is not None:
+                    base["centre"] = self.current_centre
                 if st is not None and st.dirty:                 # as on screen, unsaved
                     m = self._get_active_binary_mask() > 0 if p == self._state_path else self._annotation_of(p)
                     jobs.append({**base, "source": "unsaved edits", "mask": m})
                 elif os.path.exists(saved):
                     jobs.append({**base, "source": "saved", "mask_path": saved})
-                elif choice == all_opt:
+                elif opt["all_images"]:
                     mem = self._prob_mem.get((tag, p))
                     job = {**base, "source": "model prediction", "threshold": thr, "edge": edge}
                     if mem is not None:
@@ -3060,7 +3222,7 @@ class RootAnnotatorStudio(QtWidgets.QMainWindow):
             if not jobs:
                 self.status_info_lbl.setText("Nothing to export: no image of this folder is annotated yet.")
                 return
-            w = ExportWorker(out, jobs, self.px_per_mm)
+            w = ExportWorker(out, jobs, self.px_per_mm, opt["per_root"], opt["centre_lines"])
             w.progress.connect(lambda i, n: self.status_info_lbl.setText(f"📊 Exporting root traits ... {i}/{n} images"))
             w.done.connect(self._on_export_done)
             self._export_worker = w
@@ -3075,7 +3237,8 @@ class RootAnnotatorStudio(QtWidgets.QMainWindow):
             self.status_info_lbl.setText(f"✗ Export failed after {n} rows: {err}")
             QtWidgets.QMessageBox.warning(self, "Export failed", f"{err}\n\n{path}")
         else:
-            self.status_info_lbl.setText(f"📊 Exported {n} image(s) to {path}" + (" (stopped early)" if err else ""))
+            what = "root row(s)" if path.lower().endswith("_roots.csv") else "image(s)"
+            self.status_info_lbl.setText(f"📊 Exported {n} {what} to {path}" + (" (stopped early)" if err else ""))
 
     def _on_delete_folder_edits(self):
         """Every edit of the folder goes: saved masks / overlays / traits table / simulator fit are moved to
@@ -3411,9 +3574,7 @@ class RootAnnotatorStudio(QtWidgets.QMainWindow):
 
     def _on_px_per_mm_changed(self, val: float):
         self.px_per_mm = float(val)
-        mask = self._get_active_binary_mask()
-        if mask is not None:
-            self._compute_and_display_traits(mask)
+        self._refresh_traits()
 
     def _on_mouse_pixel_info(self, x: int, y: int, prob_val: float):
         self.status_pixel_lbl.setText(f"X: {x:4d}  Y: {y:4d}  |  Model Prob: {prob_val:.3f}")
@@ -3426,8 +3587,111 @@ class RootAnnotatorStudio(QtWidgets.QMainWindow):
             mask = self._get_active_binary_mask()
             if mask is not None:
                 self._compute_and_display_traits(mask)
+                if self._length_from_centre():                  # separated roots: shown when ready
+                    if self._current_separation() is not None:
+                        self._show_separation_traits()
+                    else:
+                        self._request_separation()
         except Exception as exc:                                # a slot must never raise (PyQt aborts)
             self.status_info_lbl.setText(f"Traits not updated: {exc}")
+
+    # --------------------------------------------------------------------------
+    # Separated roots (the model's centre-line map)
+    # --------------------------------------------------------------------------
+    def _length_from_centre(self) -> bool:
+        return self.length_src_combo.currentIndex() == 0
+
+    def _sep_key(self) -> tuple:
+        """What a separation was made from: image, edits, model mask (threshold) and centre-line map."""
+        mm = self._model_mask()
+        return (self._current_path(), id(self.state), self.state.rev if self.state is not None else -1,
+                id(mm), id(self.current_centre))
+
+    def _current_separation(self) -> Optional[tuple]:
+        r = self._sep_result
+        return r[1] if (r is not None and self.state is not None and r[0] == self._sep_key()) else None
+
+    def _request_separation(self):
+        """Separate the roots on screen in the background (each edit / threshold / new map starts it again)."""
+        try:
+            if self.current_rgb is None or self.state is None or self._current_separation() is not None:
+                return
+            if self._sep_worker is not None and self._sep_worker.isRunning():
+                self._sep_wanted = True                         # again with the latest state when it is done
+                return
+            mask = self._get_active_binary_mask()
+            if mask is None:
+                return
+            w = SeparationWorker(self._sep_key(), mask > 0, self.current_centre)
+            w.done.connect(self._on_separation_done)
+            self._sep_worker, self._sep_wanted = w, False
+            w.start()
+        except Exception as exc:
+            self.status_info_lbl.setText(f"Root separation not started: {exc}")
+
+    def _on_separation_done(self, key: tuple, res, err: str):
+        try:
+            if res is not None:
+                self._sep_result = (key, res)
+            elif err:
+                self.status_info_lbl.setText(f"Root separation failed: {err}")
+            if self.state is not None and key == self._sep_key():
+                if self.view_mode_combo.currentText() == SEP_VIEW:
+                    self._update_overlays()
+                    if res is not None and time.time() >= self._status_hold_until:
+                        sep, _, model_used = res
+                        self.status_info_lbl.setText(
+                            f"✂ {sep.n} roots separated "
+                            + ("along the model's centre lines" if model_used else
+                               "by the mask's shape (the model's centre-line map is not here yet)")
+                            + " - white: centre lines, each colour one root.")
+                if self._length_from_centre():
+                    self._show_separation_traits()
+            elif self._sep_wanted or (self.view_mode_combo.currentText() == SEP_VIEW or self._length_from_centre()):
+                self._sep_wanted = False
+                self._request_separation()                      # the screen changed meanwhile
+        except Exception as exc:
+            self.status_info_lbl.setText(f"Root separation not shown: {exc}")
+
+    def _show_separation_traits(self):
+        r = self._current_separation()
+        mask = self._get_active_binary_mask()
+        if r is None or mask is None:
+            return
+        sep, length_px, model_used = r
+        L = length_px / self.px_per_mm
+        area = float((mask > 0).sum()) / self.px_per_mm ** 2
+        self.trait_len_lbl.setText(f"Total Length: {L:.1f} mm ({L / 10.0:.2f} cm)")
+        self.trait_len_lbl.setToolTip("Along the roots' centre lines, separated "
+                                      + ("by the model's centre-line map." if model_used else "by the mask's shape."))
+        self.trait_diam_lbl.setText(f"Mean Diameter: {(area / L) if L > 0 else 0.0:.2f} mm")
+        self.trait_count_lbl.setText(f"Roots: {sep.n} separated")
+
+    def _separation_image(self) -> Optional[np.ndarray]:
+        """The frame with every separated root coloured (cached per separation)."""
+        r = self._current_separation()
+        if r is None:
+            return None
+        if self._sep_view[0] is not r:
+            from exp_realism import root_separation as RS
+            self._sep_view = (r, RS.colour_image(self.current_rgb, r[0]))
+        return self._sep_view[1]
+
+    def _on_centre_ready(self, tag: str, path: str, centre: np.ndarray):
+        try:
+            key = (tag, path)
+            self._centre_mem.pop(key, None)
+            self._centre_mem[key] = centre
+            while len(self._centre_mem) > 1 and sum(c.nbytes for c in self._centre_mem.values()) > 256 * 1024 * 1024:
+                self._centre_mem.popitem(last=False)
+            if tag == self._current_tag() and path == self._current_path():
+                self.current_centre = centre
+                if self.view_mode_combo.currentText() == SEP_VIEW or self._length_from_centre():
+                    self._request_separation()
+                if self.view_mode_combo.currentText() == SEP_VIEW:
+                    self._update_overlays()
+        except Exception as exc:
+            self.status_info_lbl.setText(f"Centre lines not applied: {exc}")
 
     def _compute_and_display_traits(self, mask: np.ndarray):
         m = mask > 0

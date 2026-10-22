@@ -156,7 +156,7 @@ def predict_image(model: torch.nn.Module, rgb_u8: np.ndarray, to_input: Callable
                   scale: float = 1.0, device="cpu", tta: bool = True,
                   amp_dtype: Optional[torch.dtype] = None, tile: int = 768, overlap: int = 128,
                   batch: int = 4, max_full: int = 1024,
-                  out_hw: Optional[Tuple[int, int]] = None) -> np.ndarray:
+                  out_hw: Optional[Tuple[int, int]] = None, all_channels: bool = False) -> np.ndarray:
     """Probability map (float32, ``out_hw`` or the input's size) of one image.
 
     The image is resized by ``scale`` (network px per input px: the source's
@@ -164,6 +164,8 @@ def predict_image(model: torch.nn.Module, rgb_u8: np.ndarray, to_input: Callable
     training crops -- normalised with ``to_input`` (HxWx3 0-1 -> CxHxW),
     predicted with :func:`predict_tiled` (+TTA), and resized back: INTER_AREA
     when the map is larger than ``out_hw`` (v1's SCALE=2 path), else linear.
+    ``all_channels``: every output (C x H x W, e.g. root probability and the
+    centre-line distance head) instead of the first only.
     """
     model.eval()
     im = np.asarray(rgb_u8)
@@ -175,12 +177,15 @@ def predict_image(model: torch.nn.Module, rgb_u8: np.ndarray, to_input: Callable
         im = cv2.resize(im, size, interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC)
     x_dev = "cpu" if (im.shape[0] * im.shape[1] > 9_000_000) else device
     x = torch.from_numpy(to_input(im.astype(np.float32) / 255.0))[None].to(x_dev)
-    p = predict_tiled(prob_fn(model, tta, amp_dtype, device=device), x, tile, overlap, batch=batch,
-                      max_full=max_full)[0, 0].float().cpu().numpy()
-    if p.shape != (oh, ow):
-        interp = cv2.INTER_AREA if p.shape[0] * p.shape[1] > oh * ow else cv2.INTER_LINEAR
-        p = cv2.resize(p, (ow, oh), interpolation=interp)
-    return p.astype(np.float32)
+    out = predict_tiled(prob_fn(model, tta, amp_dtype, device=device), x, tile, overlap, batch=batch,
+                        max_full=max_full)[0].float().cpu().numpy()
+    maps = []
+    for p in (out if all_channels else out[:1]):
+        if p.shape != (oh, ow):
+            interp = cv2.INTER_AREA if p.shape[0] * p.shape[1] > oh * ow else cv2.INTER_LINEAR
+            p = cv2.resize(p, (ow, oh), interpolation=interp)
+        maps.append(p.astype(np.float32))
+    return np.stack(maps) if all_channels else maps[0]
 
 
 __all__ = ["FLIPS", "pad_to_multiple", "unpad", "hann2d", "tile_starts", "predict_tiled",

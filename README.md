@@ -43,11 +43,21 @@ retrained on your corrections.
 - Optional synthetic training images from the built-in root simulator, fitted to the widths, lengths
   and colours of your annotated roots, rendered on your own soil.
 
+**Separating touching roots**
+- The model has a second output, a centre-line map (1 in the middle of every root), which tells touching
+  and crossing roots apart. **Separate roots** (Display View) shows every root in its own colour with its
+  centre line: centre lines are cut at junctions and the pieces that continue straight through a crossing
+  are joined, then every root pixel goes to its root. On a dense CI-600 scan: 2,001 roots where the mask
+  had 627 blobs.
+- **Length from: Centre lines** (default) measures along these centre lines - the skeleton of a clump grows
+  spurious spokes (22 % more length on that scan). Hand-drawn shapes use their own shape.
+
 **Results**
 - Each saved image: `_annotations/<image>_mask.png`, an overlay, and a row in `traits_summary.csv`.
 - **Export CSV…**: one row per image with its name, site / tube / window / date / time / session and
   the roots' length, projected and surface area, volume, mean diameter, coverage, length density,
-  endpoints, branch points and length by diameter class (0 for images without roots) - for the annotated
+  endpoints, branch points and length by diameter class (0 for images without roots) - or **one row per
+  root** (separated roots: length, diameter, area, surface, volume, position) - for the annotated
   images, or for all images with the model's prediction where you have not annotated.
 
 ## Install
@@ -97,8 +107,8 @@ python roosterfly.py --dir "path/to/image/folder"
 <image folder>/_annotations/
     <image>_mask.png  <image>_overlay.jpg     saved annotations
     traits_summary.csv                        one row per saved image
-    roots_export_<date>.csv                   Export CSV
-    _prob_cache/<model>/                      cached predictions
+    roots_export_<date>[_roots].csv           Export CSV (per image / per root)
+    _prob_cache/<model>/, <model>_cl/         cached predictions and centre-line maps
     _deleted_<date-time>/                     what "Delete all" removed
 ```
 

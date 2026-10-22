@@ -23,7 +23,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -144,18 +144,27 @@ def load_model_bundle(project_root: str, run_name: str, device: str) -> Dict[str
         "device": device,
         "thresh": thresh,
         "border_mask": border,
+        "n_out": out_classes,                       # 2: root probability + centre-line head
     }
 
 
 def predict_prob(bundle: Dict[str, Any], rgb: np.ndarray, tta: bool = False) -> np.ndarray:
     """Full-resolution root probability map (float32 HxW) of a uint8 RGB image."""
+    return predict_maps(bundle, rgb, tta)[0]
+
+
+def predict_maps(bundle: Dict[str, Any], rgb: np.ndarray, tta: bool = False) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """(root probability, centre-line map or None) from one forward pass.
+
+    The centre-line map is the model's second head (trained on the root's distance transform over its
+    local maximum: 1 in the middle of every root, falling to its edges) -- it tells touching roots apart."""
     from exp_realism.eval_grid_counted import hist_match
     from mrmodel.tiling import predict_image
 
     rgb_matched = hist_match(rgb, bundle["cdf_ref"])
     H, W = rgb_matched.shape[:2]
     tile_sz = 768 if max(H, W) > 768 else max(H, W)
-    return predict_image(
+    maps = predict_image(
         bundle["model"],
         rgb_matched,
         bundle["to_input"],
@@ -165,7 +174,14 @@ def predict_prob(bundle: Dict[str, Any], rgb: np.ndarray, tta: bool = False) -> 
         tile=tile_sz,
         overlap=64,
         batch=2,
+        all_channels=True,
     )
+    return maps[0], (maps[1] if len(maps) > 1 else None)
+
+
+def centre_cache_path(img_path: str, tag: str, cache_dir: str = "") -> str:
+    """Where the centre-line map of an image is cached (next to its probability map)."""
+    return prob_cache_path(img_path, tag + "_cl", cache_dir)
 
 
 def border_bars(rgb: np.ndarray, dark: float = 0.55, flat: float = 0.15, margin: int = 6, edge: int = 3) -> np.ndarray:
@@ -234,7 +250,10 @@ def precompute_folder(project_root: str, run_name: str, folder: str, cache_dir: 
         if rgb is None:
             print(f"[precompute] unreadable: {f}", flush=True)
             continue
-        save_cached_prob(prob_cache_path(f, tag, cache_dir), predict_prob(bundle, rgb, tta))
+        prob, centre = predict_maps(bundle, rgb, tta)
+        save_cached_prob(prob_cache_path(f, tag, cache_dir), prob)
+        if centre is not None:
+            save_cached_prob(centre_cache_path(f, tag, cache_dir), centre)
         if i % 25 == 0 or i == len(todo):
             rate = (time.time() - t0) / i
             eta = rate * (len(todo) - i)
